@@ -1735,9 +1735,15 @@ function syncPill() {
    <button class="pill" data-act="syncPanel">${txt}</button>`;
 }
 function excelPill() {
-  const e = C.excel;
-  const txt = !e.enabled ? 'Excel: download on demand' : e.failed ? 'Excel sync failed' : e.pending ? 'Excel sync pending' : e.last ? 'Excel synced ' + fmtDT(e.last) : 'Excel not synced yet';
-  return `<button class="pill" data-act="syncPanel" title="SharePoint master workbook">${txt}</button>`;
+  const e = C.excel; const wm = e.lastWatermark;
+  const newer = wm ? Object.values(S.records || {}).filter(r => r.updatedAt > wm).length : null;
+  const txt = e.failed ? 'Excel sync failed' : !e.last ? 'Excel workbook not synced yet' : `Excel updated ${fmtDT(e.last)}${newer ? ' · ' + newer + ' newer site update(s) pending' : ' · up to date'}`;
+  return `<button class="pill" data-act="syncPanel" title="Master workbook: updated when the SiteTrack Sync script runs in Excel">${txt}</button>`;
+}
+function excelStateOf(r) {
+  if (!r) return '';
+  const wm = C.excel.lastWatermark;
+  return wm && r.updatedAt <= wm ? `<span class="tag done">In master Excel</span>` : `<span class="tag risk">Excel sync pending</span>`;
 }
 function renderHeaderOnly() { const h = $('#syncPills'); if (h) h.innerHTML = syncPill() + excelPill(); }
 function syncPanel() {
@@ -1941,7 +1947,7 @@ updateForm = function (zone, act) {
    <div class="row" style="align-items:flex-start"><div class="grow"><h2 style="margin:0">${esc(act.name)}</h2>
      <div class="small muted">${esc(S.idx.zone[zone.id].l.name)} · ${esc(zone.name)} · ID ${esc(act.id)} · approved weight ${act.weight} · ${act.method === 'qty' ? 'measured in ' + esc(act.unit) : act.method === 'milestone' ? 'weighted milestones' : 'stage-based'}</div></div>
      <div style="text-align:right"><div class="pctbig" id="pctOut">${pct(d.pct)}</div><div class="tiny muted">your entry · saved ${pct(r?.pct || 0)} · PMC verified ${pct(r?.verifiedPct || 0)}</div></div></div>
-   ${r ? `<div class="small" style="margin:8px 0">Saved online ${fmtDT(r.updatedAt)} by ${esc(r.updatedBy)} · ${wfTag(r)}${['returned', 'pmc_rejected'].includes(r.workflow) && r.reviewComment ? ` <span class="h-delayed">${esc(r.reviewComment)}</span>` : ''}</div>` : ''}
+   ${r ? `<div class="small" style="margin:8px 0">Saved online ${fmtDT(r.updatedAt)} by ${esc(r.updatedBy)} · ${wfTag(r)} · ${excelStateOf(r)}${['returned', 'pmc_rejected'].includes(r.workflow) && r.reviewComment ? ` <span class="h-delayed">${esc(r.reviewComment)}</span>` : ''}</div>` : ''}
    ${pend ? `<div class="disclaim">An update for this activity is saved on this phone and ${pend.state === 'conflict' ? 'has a conflict to resolve' : pend.state === 'failed' ? 'failed to synchronize' : 'is waiting to synchronize'}. <a href="#" data-act="syncPanel">View</a></div>` : ''}
    ${depWarn.length ? `<div class="disclaim">Predecessor not complete: ${depWarn.map(a => esc(a.name) + ' ' + pct(rec(zone.id, a.id)?.pct || 0)).join(', ')}</div>` : ''}
    <div class="field"><label class="f">Status</label><div class="seg">${STATUS.map(s => `<button data-act="setStatus" data-s="${s}" class="${d.status === s ? 'on' : ''}">${s}</button>`).join('')}</div></div>
@@ -2373,6 +2379,88 @@ document.addEventListener('keydown', e => { if (e.key === 'Enter' && !S.user && 
   if (location.hash.includes('type=recovery')) S.ui.recovery = true;
   if (session && !S.ui.recovery) { try { await startSession(); } catch (e) { toast(e.message, true); render(); } } else render();
 })();
+
+/* ---------------- quick checklist: all activities of a location, one Save button ---------------- */
+const QUICK_STAGES = [0, 10, 25, 50, 75, 100];
+function quickChecklist(zone) {
+  const F = S.form; const loc = S.idx.zone[zone.id].l;
+  if (!S.quick || S.quick.zoneId !== zone.id) S.quick = { zoneId: zone.id, changes: {}, remark: '' };
+  const Q = S.quick; const acts = zoneActs(zone, F.discId || undefined);
+  const groups = {}; acts.forEach(a => (groups[S.idx.act[a.id].d.name] = groups[S.idx.act[a.id].d.name] || []).push(a));
+  const nChanged = Object.keys(Q.changes).length;
+  const counts = { done: 0, ongoing: 0, outstanding: 0, blocked: 0 };
+  acts.forEach(a => { const r = rec(zone.id, a.id); if (r?.status === 'Blocked' || r?.status === 'On Hold') counts.blocked++; else if ((r?.pct || 0) >= 100) counts.done++; else if ((r?.pct || 0) > 0) counts.ongoing++; else counts.outstanding++; });
+  return `<div class="card">
+   <div class="row" style="align-items:flex-start"><div class="grow"><h2 style="margin:0">${esc(loc.name)}${loc.zones.length > 1 ? ' · ' + esc(zone.name) : ''}</h2>
+    <div class="small muted">${esc(S.idx.zone[zone.id].f.code)} · ${acts.length} activities · tap a stage to change it, then Save all</div></div>
+    <div class="pctbig" style="font-size:1.6rem">${pct(zoneCalc(zone).rep)}</div></div>
+   <div class="chips" style="margin:10px 0"><span class="tag done">${counts.done} completed</span><span class="tag ok">${counts.ongoing} ongoing</span><span class="tag ns">${counts.outstanding} outstanding</span><span class="tag blocked">${counts.blocked} blocked / on hold</span></div>
+   ${Object.entries(groups).map(([dn, as]) => `<h3 style="margin:14px 0 6px">${esc(dn)}</h3>${as.map(a => {
+     const r = rec(zone.id, a.id); const ch = Q.changes[a.id]; const cur = r ? (a.method === 'stage' ? (r.stage ?? r.pct) : r.pct) : 0;
+     const sel = ch ? ch.stage : cur; const st = ch?.status || r?.status || 'Not Started';
+     return `<div class="list-item" style="${ch ? 'background:#fff8e6;margin:0 -16px;padding:10px 16px' : ''}">
+       <div class="row"><b class="grow">${esc(a.name)}</b><span class="small">${r ? `${esc(r.status)} · ${pct(r.pct)}` : 'Not started'}</span> ${hTag(health(r))}</div>
+       ${a.method === 'stage' ? `<div class="seg" style="margin-top:6px">${QUICK_STAGES.map(s => `<button data-act="qStage" data-a="${a.id}" data-v="${s}" class="${+sel === s ? 'on' : ''}" style="min-height:40px;padding:0 6px">${s === 0 ? '0' : s === 10 ? 'Start' : s + '%'}</button>`).join('')}</div>
+         <div class="row" style="margin-top:6px"><select data-ch="qStatus" data-a="${a.id}" style="max-width:190px;min-height:36px;padding:4px 8px"><option value="">Status: auto</option>${['On Hold', 'Blocked'].map(s => `<option ${ch?.status === s ? 'selected' : ''}>${s}</option>`).join('')}</select>
+         <button class="btn ghost sm" data-act="openUpdate" data-z="${zone.id}" data-a="${a.id}">Details / photo</button>${r && r.id ? excelStateOf(r) : ''}</div>`
+       : `<div class="row" style="margin-top:6px"><span class="small muted">Measured by ${a.method === 'qty' ? 'quantity' : 'milestones'}</span><button class="btn sec sm" data-act="openUpdate" data-z="${zone.id}" data-a="${a.id}">Update</button></div>`}
+     </div>`; }).join('')}`).join('')}
+   <div class="field" style="margin-top:12px"><label class="f" for="qRem">Remark for the changed activities (optional)</label><input type="text" id="qRem" value="${esc(Q.remark)}" data-in="qRemark" placeholder="e.g. 2nd coat done in living and bedrooms"></div>
+   <div class="row"><button class="btn grow" data-act="qSave" ${nChanged ? '' : 'disabled'}>Save all${nChanged ? ' (' + nChanged + ' changed)' : ''}</button>${nChanged ? '<button class="btn sec" data-act="qReset">Undo changes</button>' : ''}</div>
+   <div class="tiny muted" style="margin-top:6px">Use "Details / photo" to add photos, quantities, dates or an inspection request for one activity.</div></div>`;
+}
+viewUpdate = (orig => function () {
+  let html = orig();
+  const F = S.form; const zone = F.zoneId ? S.idx.zone[F.zoneId]?.z : null;
+  if (zone && !F.actId && can('update')) {
+    html = html.replace(/<div class="card muted">Choose a location and activity[\s\S]*?<\/div>\s*$/, '') + quickChecklist(zone);
+    html = html.replace('<label class="f" for="sAct">Activity</label>', '<label class="f" for="sAct">Activity (optional - the checklist below shows them all)</label>');
+  }
+  return html;
+})(viewUpdate);
+Object.assign(ACT, {
+  qStage: el => { const Q = S.quick; const a = S.idx.act[el.dataset.a].a; const r = rec(Q.zoneId, a.id); const v = +el.dataset.v; const cur = r ? (r.stage ?? r.pct) : 0;
+    const prevStatus = Q.changes[a.id]?.status; if (v === +cur && !prevStatus) delete Q.changes[a.id]; else Q.changes[a.id] = { stage: v, status: prevStatus || '' }; render(); },
+  qReset: () => { S.quick.changes = {}; render(); },
+  qSave: async () => {
+    const Q = S.quick; const zone = S.idx.zone[Q.zoneId]; const ids = Object.keys(Q.changes); if (!ids.length) return;
+    const items = ids.map(aid => { const a = S.idx.act[aid].a; const c = Q.changes[aid]; const r = rec(Q.zoneId, aid);
+      const status = c.status || (c.stage >= 100 ? 'Completed' : c.stage > 0 ? 'In Progress' : 'Not Started');
+      return queueSubmission(Q.zoneId, aid, { status, reported_pct: c.stage, stage: c.stage, remarks: Q.remark.trim() || r?.remarks || '', reported_on_site_at: nowISO() }, `${zone.f.code} · ${zone.l.name} · ${a.name}`); });
+    const bad = items.find(i => i.data.status === 'Completed' && i.data.reported_pct < 100); if (bad) { toast('Completed needs 100%.', true); return; }
+    C.outbox.push(...items); await outboxSave(); S.quick = null;
+    if (!navigator.onLine) { toast(`${items.length} updates saved on this phone - pending sync`); render(); return; }
+    const res = await processOutbox(); const ok = (res || []).filter(x => items.includes(x.it) && (x.r === 'saved' || x.r === 'duplicate')).length;
+    const conflicts = (res || []).filter(x => items.includes(x.it) && x.r === 'conflict').length;
+    toast(ok === items.length ? `Saved online ✓ ${ok} activities` : `Saved online ${ok} of ${items.length}${conflicts ? ` · ${conflicts} changed by someone else - see sync panel` : ' · see sync panel'}`, ok !== items.length);
+    render();
+  }
+});
+Object.assign(CH, { qStatus: (v, el) => { const Q = S.quick; const aid = el.dataset.a; const r = rec(Q.zoneId, aid); const cur = r ? (r.stage ?? r.pct) : 0; const c = Q.changes[aid] || { stage: +cur, status: '' }; c.status = v; if (!v && c.stage === +cur) delete Q.changes[aid]; else Q.changes[aid] = c; render(); } });
+Object.assign(IN, { qRemark: v => { if (S.quick) S.quick.remark = v; } });
+
+/* ---------------- photos: structured folders + photos in the location view ---------------- */
+const slug = s => String(s || '').normalize('NFKD').replace(/[^A-Za-z0-9._-]+/g, '-').replace(/-+/g, '-').replace(/^-|-$/g, '').slice(0, 60);
+uploadPhoto = async function (ph, p, subId) {
+  const z = S.idx.zone[p.zone_id]; const a = S.idx.act[p.activity_id]?.a;
+  const day = (ph.ts || nowISO()).slice(0, 10);
+  const path = ['SHA-Apartments', 'Site-Progress-Photos', slug(z?.f.code || 'Floor'), slug(`${z?.l.id}_${z?.l.name}`), slug(`${p.zone_id}_${z?.z.name}`), slug(`${p.activity_id}_${a?.name}`), day, `${ph.id}.jpg`].join('/');
+  const blob = await (await fetch(ph.data)).blob();
+  const up = await sb.storage.from('site-photos').upload(path, blob, { contentType: 'image/jpeg', upsert: false });
+  if (up.error && !/exist|Duplicate/i.test(up.error.message)) throw up.error;
+  await q(sb.from('photos').upsert({ progress_id: p.id, submission_id: subId || null, project_id: p.project_id, storage_path: path, tag: ph.tag, taken_at: ph.ts, uploaded_by: C.me.id }, { onConflict: 'storage_path', ignoreDuplicates: true }));
+};
+openLoc = (orig => function (id) {
+  orig(id); const m = $('#mask .modal'); const l = S.idx.loc[id]?.l; if (!m || !l) return;
+  m.insertAdjacentHTML('beforeend', `<div id="locPhotos" style="margin-top:14px"><h3>Site photos</h3><div class="small muted">Loading…</div></div>`);
+  const ids = Object.values(S.records).filter(r => l.zones.some(z => z.id === r.zone) && r.id).map(r => r.id);
+  if (!ids.length) { $('#locPhotos').innerHTML = '<h3>Site photos</h3><div class="muted small">No photos yet.</div>'; return; }
+  q(sb.from('photos').select('*').in('progress_id', ids).order('uploaded_at', { ascending: false }).limit(60)).then(async phs => {
+    const urls = phs.length ? await q(sb.storage.from('site-photos').createSignedUrls(phs.map(p => p.storage_path), 3600)) : [];
+    const box = $('#locPhotos'); if (!box) return;
+    box.innerHTML = `<h3>Site photos (${phs.length})</h3>${phs.length ? `<div class="photos">${phs.map((p, i) => { const r = Object.values(S.records).find(x => x.id === p.progress_id); return `<figure><a href="${esc(urls[i]?.signedUrl || '#')}" target="_blank" rel="noopener"><img src="${esc(urls[i]?.signedUrl || '')}" alt="${esc(p.tag)} photo"></a><figcaption>${esc(S.idx.act[r?.act]?.a.name || '')}<br>${esc(p.tag)} · ${fmtDT(p.taken_at || p.uploaded_at)}<br>${esc(nameOf(p.uploaded_by))}</figcaption></figure>`; }).join('')}</div>` : '<div class="muted small">No photos yet.</div>'}`;
+  }).catch(() => { const box = $('#locPhotos'); if (box) box.innerHTML = '<h3>Site photos</h3><div class="muted small">Photos need a connection.</div>'; });
+})(openLoc);
 
 </script>
 </body>
